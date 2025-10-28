@@ -3,6 +3,7 @@ import {
   Connection,
   PublicKey,
   Keypair,
+  TransactionInstruction,
   TransactionSignature,
 } from '@solana/web3.js';
 import {
@@ -20,7 +21,10 @@ import {
   pipe,
   signTransaction,
   getTransactionDecoder,
+  // getBase64Encoder,   // not used now
   createKeyPairSignerFromBytes,
+  // getBase64EncodedWireTransaction might exist or not depending on kit version
+  // we'll attempt to import it dynamically below
 } from '@solana/kit';
 import { GatewayService } from './gateway.service';
 import { PrismaClient } from '@prisma/client';
@@ -116,17 +120,45 @@ export class DistributorService {
     await Promise.allSettled(promises);
   }
 
+  // Gateway-integrated token sending with ATA creation and strong diagnostics
   private async sendTokenToRecipient(recipient: Recipient, campaign: Campaign) {
     try {
       console.log(`Processing recipient: ${recipient.address}`);
 
+      const tokenMint = new PublicKey(campaign.tokenMint);
+      const recipientWallet = new PublicKey(recipient.address);
+      const sourceAccount = new PublicKey(campaign.sourceTokenAccount);
+
       const recipientATA = await getAssociatedTokenAddress(
-        new PublicKey(campaign.tokenMint),
-        new PublicKey(recipient.address)
+        tokenMint,
+        recipientWallet,
+        false,
+        TOKEN_PROGRAM_ID
       );
 
+      console.log(`Recipient ATA: ${recipientATA.toString()}`);
+
+      // Check if recipient token account exists
+      const recipientAccountInfo = await this.connection.getAccountInfo(recipientATA);
+      const instructions: TransactionInstruction[] = [];
+
+      if (!recipientAccountInfo) {
+        console.log(`📝 Creating token account for ${recipient.address}`);
+        const { createAssociatedTokenAccountInstruction } = await import('@solana/spl-token');
+
+        const createATAIx = createAssociatedTokenAccountInstruction(
+          this.authority.address,
+          recipientATA,
+          recipientWallet,
+          tokenMint
+        );
+
+        instructions.push(createATAIx);
+      }
+
+      // Add transfer instruction
       const transferIx = createTransferInstruction(
-        new PublicKey(campaign.sourceTokenAccount),
+        sourceAccount,
         recipientATA,
         this.authority.address,
         BigInt(Math.floor(recipient.amount * Math.pow(10, campaign.tokenDecimals))),
@@ -134,15 +166,19 @@ export class DistributorService {
         TOKEN_PROGRAM_ID
       );
 
-      // Build unsigned transaction using kit pipeline.
+      instructions.push(transferIx);
+
+      console.log(`🔧 Building transaction with ${instructions.length} instruction(s)...`);
+
+      // Build unsigned transaction via kit pipeline
       const unsignedTransaction = pipe(
         createTransactionMessage({ version: 0 }),
-        (txm) => appendTransactionMessageInstructions([transferIx as unknown as any], txm),
-        (txm) => setTransactionMessageFeePayerSigner(this.authority as unknown as any, txm),
+        (txm) => appendTransactionMessageInstructions(instructions.map(ix => ix as any), txm),
+        (txm) => setTransactionMessageFeePayerSigner(this.authority as any, txm),
         (m) =>
           setTransactionMessageLifetimeUsingBlockhash(
             {
-              blockhash: ('11111111111111111111111111111111' as unknown) as any,
+              blockhash: '11111111111111111111111111111111' as any,
               lastValidBlockHeight: 1000n,
             } as any,
             m
@@ -150,80 +186,210 @@ export class DistributorService {
         compileTransaction
       );
 
-      const gatewayParams = campaign.mode === 'high-assurance'
-        ? { cuPriceRange: 'high' as const, jitoTipRange: 'high' as const }
-        : { cuPriceRange: 'low' as const };
+      console.log('✅ Transaction compiled. Now encoding to base64 for Gateway...');
 
-      // Build via Gateway (pass base64 string). Attempt to create a base64 of compiled tx safely:
-      const compiledBase64 = ((): string => {
-        try {
-          const compiled = unsignedTransaction as any;
-          if (compiled?.serialize) {
-            return Buffer.from(compiled.serialize()).toString('base64');
-          }
-          if (typeof compiled === 'string') return compiled;
-          return Buffer.from(JSON.stringify(compiled)).toString('base64');
-        } catch (e) {
-          return Buffer.from(JSON.stringify(unsignedTransaction)).toString('base64');
-        }
-      })();
+      // --- Robust serialization to base64 (try kit helper, then fallbacks) ---
+      let compiledBase64: string | null = null;
 
-      const base64BuildResult = await this.gateway.buildGatewayTransaction(compiledBase64, gatewayParams as any);
-
-      const buildResult = base64BuildResult as any as {
-        transaction: string;
-        latestBlockhash: any;
-      };
-
-      // decode base64 -> bytes
-      const txBytes = Buffer.from(buildResult.transaction, 'base64');
-      const optimizedTx = getTransactionDecoder().decode(Uint8Array.from(txBytes));
-
-      const signedTx = await signTransaction([this.authority.keyPair] as any, optimizedTx as any);
-
-      let signedBase64: string;
+      // 1) try kit helper if available
       try {
-        if (signedTx?.serialize) {
-          signedBase64 = Buffer.from((signedTx as any).serialize()).toString('base64');
-        } else if (typeof signedTx === 'string') {
-          signedBase64 = signedTx;
-        } else {
-          signedBase64 = Buffer.from(JSON.stringify(signedTx)).toString('base64');
+        // dynamic require to avoid TS errors if function not present
+        const maybeKit: any = await import('@solana/kit');
+        if (typeof maybeKit.getBase64EncodedWireTransaction === 'function') {
+          compiledBase64 = maybeKit.getBase64EncodedWireTransaction(unsignedTransaction);
+          console.log('Used kit.getBase64EncodedWireTransaction()');
         }
-      } catch (err) {
-        signedBase64 = Buffer.from(JSON.stringify(signedTx)).toString('base64');
+      } catch (e) {
+        // ignore - we'll try fallbacks
       }
 
-      const signature = (await this.gateway.sendTransaction(signedBase64)) as TransactionSignature;
+      // 2) fallback: if the unsignedTransaction has .serialize()
+      if (!compiledBase64) {
+        try {
+          if (typeof (unsignedTransaction as any).serialize === 'function') {
+            const bytes = (unsignedTransaction as any).serialize();
+            compiledBase64 = Buffer.from(bytes).toString('base64');
+            console.log('Used unsignedTransaction.serialize() fallback');
+          }
+        } catch (e) {
+          // ignore and continue to other fallbacks
+        }
+      }
+
+      // 3) fallback: look for messageBytes or raw Uint8Array
+      if (!compiledBase64) {
+        try {
+          const msgBytes = (unsignedTransaction as any).messageBytes ?? (unsignedTransaction as any).message?.bytes;
+          if (msgBytes && (msgBytes instanceof Uint8Array || Array.isArray(msgBytes))) {
+            compiledBase64 = Buffer.from(msgBytes as any).toString('base64');
+            console.log('Used unsignedTransaction.messageBytes fallback');
+          } else if (unsignedTransaction instanceof Uint8Array) {
+            compiledBase64 = Buffer.from(unsignedTransaction).toString('base64');
+            console.log('Used unsignedTransaction (Uint8Array) fallback');
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
+
+      // If still nothing, fail with diagnostics
+      if (!compiledBase64) {
+        console.error('❌ Could not produce a base64 wire-transaction from unsignedTransaction. Dumping object for debugging:');
+        // DO NOT stringify huge binary directly; log keys + small sample
+        try {
+          console.error('unsignedTransaction keys:', Object.keys(unsignedTransaction as any));
+          const sample = JSON.stringify((unsignedTransaction as any).messageBytes ? { messageBytesLength: (unsignedTransaction as any).messageBytes.length } : {});
+          console.error('unsignedTransaction sample:', sample);
+        } catch (e) {
+          console.error('unsignedTransaction introspect failed:', e);
+        }
+        throw new Error('Failed to serialize compiled transaction for Gateway (no valid fallback).');
+      }
+
+      // Sanity checks
+      const compiledBytes = Buffer.from(compiledBase64, 'base64');
+      console.log(`Compiled base64 length: ${compiledBase64.length} chars, bytes length: ${compiledBytes.length}`);
+      console.log(`Compiled bytes hex (first 48 chars): ${compiledBytes.toString('hex').slice(0, 48)}`);
+
+      // Gateway params
+      const gatewayParams =
+        campaign.mode === 'high-assurance'
+          ? {
+              cuPriceRange: 'high' as const,
+              jitoTipRange: 'high' as const,
+              skipPreflight: false,
+            }
+          : {
+              cuPriceRange: 'low' as const,
+              skipPreflight: false,
+            };
+
+      console.log(`Gateway mode: ${campaign.mode}`, gatewayParams);
+
+      // SEND to Gateway
+      console.log('📤 Sending compiledBase64 to Gateway.buildGatewayTransaction()...');
+      const buildResult: any = await this.gateway.buildGatewayTransaction(compiledBase64, gatewayParams as any);
+
+      console.log('📥 Gateway returned buildResult. Dumping types & sizes for debugging:');
+      try {
+        console.log('buildResult keys:', Object.keys(buildResult || {}));
+        console.log('buildResult.transaction type:', typeof buildResult?.transaction);
+        if (typeof buildResult?.transaction === 'string') {
+          console.log('buildResult.transaction length:', (buildResult.transaction as string).length);
+          const b = Buffer.from(buildResult.transaction as string, 'base64');
+          console.log('buildResult.transaction decoded bytes length:', b.length);
+          console.log('buildResult.transaction decoded hex (first 48 chars):', b.toString('hex').slice(0, 48));
+        } else {
+          console.log('buildResult.transaction (non-string) preview:', JSON.stringify(buildResult.transaction).slice(0, 200));
+        }
+        console.log('buildResult.latestBlockhash:', JSON.stringify(buildResult.latestBlockhash).slice(0, 200));
+      } catch (e) {
+        console.warn('Failed to log buildResult details:', e);
+      }
+
+      // Decode optimized transaction bytes safely
+      let optimizedTx: any;
+      try {
+        if (typeof buildResult.transaction === 'string') {
+          const txBytes = Buffer.from(buildResult.transaction, 'base64');
+          optimizedTx = getTransactionDecoder().decode(Uint8Array.from(txBytes));
+        } else if (buildResult.transaction instanceof Uint8Array) {
+          optimizedTx = getTransactionDecoder().decode(buildResult.transaction);
+        } else {
+          // last resort: attempt to JSON->string->base64 decode (unlikely)
+          const maybe = JSON.stringify(buildResult.transaction);
+          const tryBytes = Buffer.from(maybe);
+          optimizedTx = getTransactionDecoder().decode(Uint8Array.from(tryBytes));
+        }
+      } catch (e) {
+        console.error('❌ Failed to decode buildResult.transaction into optimizedTx:', e);
+        console.error('buildResult (raw):', buildResult);
+        throw e;
+      }
+
+      // Sign
+      let signedTx: any;
+      try {
+        signedTx = await signTransaction([this.authority.keyPair] as any, optimizedTx as any);
+      } catch (e) {
+        console.error('❌ signTransaction failed:', e);
+        throw e;
+      }
+
+      console.log('✅ Transaction signed locally. Now sending through Gateway.sendTransaction()');
+
+      // NOTE: gateway.sendTransaction may expect base64 or signed tx object depending on implementation.
+      // We'll try to send the signed object; if that fails, also try serialized base64.
+      let signature: TransactionSignature | null = null;
+      try {
+        signature = await this.gateway.sendTransaction(signedTx);
+      } catch (eSend1: any) {
+        console.warn('gateway.sendTransaction(signedTx) failed, attempting fallback to base64 serialized signed tx. Error:', eSend1?.message || eSend1);
+        try {
+          const serialized = (signedTx as any)?.serialize ? (signedTx as any).serialize() : null;
+          if (serialized) {
+            const signedBase64 = Buffer.from(serialized).toString('base64');
+            signature = await this.gateway.sendTransaction(signedBase64);
+          } else {
+            throw eSend1;
+          }
+        } catch (eSend2: any) {
+          console.error('All attempts to send transaction via Gateway failed:', eSend2?.message || eSend2);
+          throw eSend2;
+        }
+      }
 
       console.log(`✅ Transaction sent: ${signature}`);
 
       await prisma.recipient.update({
         where: { id: recipient.id },
-        data: { status: 'sent', txSignature: signature, attempts: recipient.attempts + 1 },
+        data: {
+          status: 'sent',
+          txSignature: signature as string,
+          attempts: recipient.attempts + 1,
+        },
       });
 
-      this.monitorConfirmation(recipient.id, signature, buildResult.latestBlockhash);
+      // Kick off confirmation monitor (does not block)
+      this.monitorConfirmation(recipient.id, signature as string, buildResult.latestBlockhash as any);
 
       return signature;
     } catch (error: any) {
-      console.error(`❌ Failed to send to ${recipient.address}:`, error?.message ?? error);
+      console.error(`❌ Failed to send to ${recipient.address}:`, error?.message || error);
+      // Dump the full error if available
+      if (error?.response) {
+        console.error('Error response body:', JSON.stringify(error.response.data || error.response, null, 2));
+      }
       await this.handleFailure(recipient, campaign, error);
     }
   }
 
-  private async monitorConfirmation(recipientId: string, signature: string, latestBlockhash: any) {
+  // Enhanced confirmation monitoring
+  private async monitorConfirmation(
+    recipientId: string,
+    signature: string,
+    latestBlockhash: any
+  ) {
     try {
+      console.log(`⏳ Monitoring confirmation for ${signature}...`);
+
       const lastValidBlockHeight =
         typeof latestBlockhash?.lastValidBlockHeight === 'bigint'
           ? latestBlockhash.lastValidBlockHeight
-          : BigInt(Number(latestBlockhash?.lastValidBlockHeight || 0));
+          : BigInt(latestBlockhash?.lastValidBlockHeight || 0);
 
-      await this.connection.confirmTransaction({
-        signature,
-        blockhash: latestBlockhash?.blockhash,
-        lastValidBlockHeight: Number(lastValidBlockHeight),
-      });
+      const confirmation = await this.connection.confirmTransaction(
+        {
+          signature,
+          blockhash: latestBlockhash?.blockhash,
+          lastValidBlockHeight: Number(lastValidBlockHeight),
+        },
+        'confirmed'
+      );
+
+      if (confirmation.value.err) {
+        throw new Error('Transaction failed on-chain');
+      }
 
       const txDetails = await this.connection.getTransaction(signature, {
         maxSupportedTransactionVersion: 0,
@@ -233,15 +399,23 @@ export class DistributorService {
 
       await prisma.recipient.update({
         where: { id: recipientId },
-        data: { status: 'confirmed', confirmedAt: new Date(), feesPaid: feePaid / 1_000_000_000 },
+        data: {
+          status: 'confirmed',
+          confirmedAt: new Date(),
+          feesPaid: feePaid / 1_000_000_000,
+        },
       });
 
-      console.log(`✅ Confirmed: ${signature}`);
+      console.log(`✅ Confirmed: ${signature} (fee: ${feePaid / 1_000_000_000} SOL)`);
     } catch (error: any) {
-      console.error(`Confirmation failed for ${signature}:`, error);
+      console.error(`❌ Confirmation failed for ${signature}:`, error?.message || error);
+
       await prisma.recipient.update({
         where: { id: recipientId },
-        data: { status: 'failed', lastError: (error as Error).message },
+        data: {
+          status: 'failed',
+          lastError: error?.message || 'Confirmation timeout',
+        },
       });
     }
   }
@@ -265,8 +439,8 @@ export class DistributorService {
     }
   }
 
+  // Type-safe Prisma aggregation fix
   private async updateCampaignStats(campaignId: string) {
-    // Build args as `any` to avoid TS expanding Prisma mapped types and causing circular-type errors.
     const groupArgs: any = {
       by: ['status'],
       where: { campaignId },
@@ -274,48 +448,26 @@ export class DistributorService {
       _sum: { feesPaid: true },
     };
 
-    // Force the Prisma client call through `any` so TypeScript doesn't try to evaluate deep mapped types.
-    const rawStats = await (prisma.recipient as any).groupBy(groupArgs) as any[];
+    const stats = (await (prisma.recipient as any).groupBy(groupArgs)) as any[];
 
-    // Helper to safely extract the numeric count from various shapes Prisma might return
-    const extractCount = (countField: any): number => {
-      if (countField == null) return 0;
-      if (typeof countField === 'number') return countField;
-      // Prisma sometimes returns { _all: number } or { _all: { some nested } } - handle common shapes
-      if (typeof countField._all === 'number') return countField._all;
-      if (typeof countField._all === 'object' && typeof (countField._all as any).value === 'number') {
-        return (countField._all as any).value;
-      }
-      // fallback: try 'count' or 'total'
-      if (typeof countField.count === 'number') return countField.count;
-      if (typeof countField.total === 'number') return countField.total;
-      return 0;
-    };
+    const totalConfirmed =
+      stats.find((s: any) => s.status === 'confirmed')?._count || 0;
+    const totalFailed =
+      stats.find((s: any) => s.status === 'failed')?._count || 0;
 
-    // Safely extract fee sums
-    const extractFees = (sumField: any): number => {
-      if (sumField == null) return 0;
-      if (typeof sumField === 'number') return sumField;
-      if (typeof sumField.feesPaid === 'number') return sumField.feesPaid;
-      if (typeof sumField.feesPaid === 'object' && typeof sumField.feesPaid.value === 'number') return sumField.feesPaid.value;
-      return 0;
-    };
-
-    const stats = rawStats || [];
-
-    const totalConfirmed = stats.find((s) => s.status === 'confirmed')
-      ? extractCount(stats.find((s) => s.status === 'confirmed')._count)
-      : 0;
-
-    const totalFailed = stats.find((s) => s.status === 'failed')
-      ? extractCount(stats.find((s) => s.status === 'failed')._count)
-      : 0;
-
-    const totalSOLSpent = stats.reduce((sum: number, s: any) => sum + Number(extractFees(s._sum)), 0);
+    const totalSOLSpent = stats.reduce((sum: number, s: any) => {
+      const fees = s._sum?.feesPaid;
+      return sum + (fees ? Number(fees) : 0);
+    }, 0);
 
     await prisma.campaign.update({
       where: { id: campaignId },
-      data: { totalConfirmed, totalFailed, totalSOLSpent, status: 'completed' },
+      data: {
+        totalConfirmed,
+        totalFailed,
+        totalSOLSpent,
+        status: 'completed',
+      },
     });
   }
 
