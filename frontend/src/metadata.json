@@ -1,5 +1,0 @@
-{
-  "name": "Airdrop Conductor",
-  "description": "A web application to create, manage, and execute token airdrop campaigns on a blockchain. Upload a recipient list, configure campaign parameters, and monitor real-time progress.",
-  "requestFramePermissions": []
-}
