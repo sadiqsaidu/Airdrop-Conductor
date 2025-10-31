@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import WalletContextProvider from './contexts/WalletContextProvider';
 import Header from './components/Header';
 import StarryBackground from './components/StarryBackground';
 import HomeView from './components/views/HomeView';
@@ -25,13 +26,15 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-zinc-950 via-neutral-950 to-black text-zinc-100 flex flex-col">
-      <StarryBackground />
-      <Header setActiveView={setActiveView} activeView={activeView} />
-      <main className="relative z-10 flex-grow">
-        {renderView()}
-      </main>
-      <Footer />
-    </div>
+    <WalletContextProvider>
+      <div className="min-h-screen bg-gradient-to-b from-zinc-950 via-neutral-950 to-black text-zinc-100 flex flex-col">
+        <StarryBackground />
+        <Header setActiveView={setActiveView} activeView={activeView} />
+        <main className="relative z-10 flex-grow">
+          {renderView()}
+        </main>
+        <Footer />
+      </div>
+    </WalletContextProvider>
   );
 }

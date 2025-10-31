@@ -2,7 +2,6 @@ import React from 'react';
 import { CheckCircle, XCircle, Clock, Loader2, ArrowLeft } from 'lucide-react';
 import { useJobPolling } from '../../hooks/useJobPolling';
 import { View } from '../../App';
-import { cancelJob } from '../../services/apiService';
 import { Task } from '../../types';
 
 interface DashboardViewProps {
@@ -51,31 +50,24 @@ const TaskRow: React.FC<{ task: Task }> = ({ task }) => {
   );
 };
 
-
 const DashboardView: React.FC<DashboardViewProps> = ({ setActiveView, jobId }) => {
-  const { jobStatus, tasks, setJobStatus } = useJobPolling(jobId);
+  const { jobStatus, tasks } = useJobPolling(jobId);
 
   if (!jobId) {
     return (
-      <div className="text-center py-20">
-        <p>No job selected. Please start a new distribution.</p>
-        <button onClick={() => setActiveView('upload')} className="mt-4 text-zinc-300 hover:text-white">Go to Upload</button>
+      <div className="max-w-7xl mx-auto px-6 py-24 relative z-10">
+        <div className="text-center py-20">
+          <p className="text-zinc-400 mb-4">No job selected. Please start a new distribution.</p>
+          <button 
+            onClick={() => setActiveView('upload')} 
+            className="px-6 py-3 bg-gradient-to-br from-zinc-200 to-white text-zinc-900 rounded-lg font-medium hover:shadow-lg hover:shadow-white/20 transition-all"
+          >
+            Go to Upload
+          </button>
+        </div>
       </div>
     );
   }
-
-  const handleCancelJob = async () => {
-    if (!window.confirm('Are you sure you want to cancel this job? This action cannot be undone.')) return;
-    try {
-      await cancelJob(jobId);
-      if (jobStatus) {
-        setJobStatus({ ...jobStatus, job_status: 'cancelled' });
-      }
-    } catch (err) {
-      console.error('Error cancelling job:', err);
-      alert('Failed to cancel job.');
-    }
-  };
 
   const progress = jobStatus ? Math.round(((jobStatus.success + jobStatus.failed) / jobStatus.total) * 100) : 0;
   
@@ -97,6 +89,11 @@ const DashboardView: React.FC<DashboardViewProps> = ({ setActiveView, jobId }) =
               <div>
                 <h2 className="text-3xl font-light mb-2 tracking-tight">Distribution Dashboard</h2>
                 <p className="text-zinc-400 text-sm font-mono">Job ID: {jobId}</p>
+                {jobStatus.distributor_address && (
+                  <p className="text-zinc-500 text-xs font-mono mt-1">
+                    From: {jobStatus.distributor_address.slice(0, 8)}...{jobStatus.distributor_address.slice(-8)}
+                  </p>
+                )}
               </div>
               <div className="flex items-center gap-3">
                 <div className={`px-4 py-2 rounded-lg font-medium text-sm capitalize ${
@@ -108,11 +105,6 @@ const DashboardView: React.FC<DashboardViewProps> = ({ setActiveView, jobId }) =
                 }`}>
                   {jobStatus.job_status}
                 </div>
-                {(jobStatus.job_status === 'running' || jobStatus.job_status === 'pending') && (
-                  <button onClick={handleCancelJob} className="px-4 py-2 border border-white/20 text-zinc-300 rounded-lg hover:border-white/40 hover:bg-white/5 transition-all text-sm">
-                    Cancel Job
-                  </button>
-                )}
               </div>
             </div>
 

@@ -39,7 +39,7 @@ const HomeView: React.FC<HomeViewProps> = ({ setActiveView, jobId }) => {
           
           <p className="text-lg text-zinc-400 mb-10 leading-relaxed font-light max-w-2xl mx-auto">
             High-performance token distribution with optimized transaction delivery. 
-            Own your data, control access, verify signatures—all on-chain.
+            Own your data, control access, verify signatures all on-chain.
           </p>
           
           <div className="flex justify-center gap-4">

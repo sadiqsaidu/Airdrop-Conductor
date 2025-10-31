@@ -1,7 +1,9 @@
 import React, { useState, useCallback } from 'react';
 import { Upload, Shield, Zap, AlertCircle, Loader2, FileText, Download, ArrowLeft } from 'lucide-react';
+import { useWallet } from '@solana/wallet-adapter-react';
+import { VersionedTransaction } from '@solana/web3.js';
 import { View } from '../../App';
-import { startJob, downloadTemplate } from '../../services/apiService';
+import { createJob, getUnsignedTransactions, submitSignedTransactions } from '../../services/apiService';
 
 interface UploadViewProps {
   setActiveView: (view: View) => void;
@@ -9,13 +11,14 @@ interface UploadViewProps {
 }
 
 const UploadView: React.FC<UploadViewProps> = ({ setActiveView, setJobId }) => {
+  const { publicKey, signAllTransactions } = useWallet();
   const [csvFile, setCsvFile] = useState<File | null>(null);
   const [tokenMint, setTokenMint] = useState('');
-  const [privateKey, setPrivateKey] = useState('');
   const [mode, setMode] = useState<'high-assurance' | 'cost-saver'>('high-assurance');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState('');
   const [dragActive, setDragActive] = useState(false);
+  const [progress, setProgress] = useState('');
 
   const handleDrag = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -57,29 +60,83 @@ const UploadView: React.FC<UploadViewProps> = ({ setActiveView, setJobId }) => {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!csvFile || !tokenMint || !privateKey) {
-        setError("Please fill all fields and upload a CSV file.");
-        return;
+    
+    if (!publicKey) {
+      setError('Please connect your wallet first.');
+      return;
     }
+
+    if (!csvFile || !tokenMint) {
+      setError('Please fill all fields and upload a CSV file.');
+      return;
+    }
+
+    if (!signAllTransactions) {
+      setError('Your wallet does not support signing multiple transactions.');
+      return;
+    }
+
     setError('');
     setIsSubmitting(true);
 
     try {
+      // Step 1: Create job
+      setProgress('Creating job...');
       const formData = new FormData();
       formData.append('csvFile', csvFile);
       formData.append('tokenMintAddress', tokenMint);
-      formData.append('privateKey', privateKey);
+      formData.append('distributorAddress', publicKey.toBase58());
       formData.append('mode', mode);
 
-      const data = await startJob(formData);
+      const jobData = await createJob(formData);
+      const currentJobId = jobData.job_id;
+      setJobId(currentJobId);
 
-      setJobId(data.job_id);
-      setActiveView('dashboard');
+      // Step 2: Get unsigned transactions
+      setProgress('Preparing transactions...');
+      const { transactions } = await getUnsignedTransactions(currentJobId);
+
+      if (transactions.length === 0) {
+        setProgress('No transactions to process.');
+        setActiveView('dashboard');
+        return;
+      }
+
+      // Step 3: Deserialize and sign transactions
+      setProgress(`Please sign ${transactions.length} transactions in your wallet...`);
+      const unsignedTxs = transactions.map((item: any) => {
+        const txBuffer = Buffer.from(item.transaction, 'base64');
+        return VersionedTransaction.deserialize(txBuffer);
+      });
+
+      const signedTxs = await signAllTransactions(unsignedTxs);
+
+      // Step 4: Serialize signed transactions
+      setProgress('Submitting transactions...');
+      const signedTransactionsData = signedTxs.map((tx, index) => ({
+        task_id: transactions[index].task_id,
+        transaction: Buffer.from(tx.serialize()).toString('base64'),
+      }));
+
+      // Step 5: Submit to backend
+      await submitSignedTransactions(currentJobId, signedTransactionsData);
+
+      setProgress('Success! Redirecting to dashboard...');
+      setTimeout(() => {
+        setActiveView('dashboard');
+      }, 1000);
+
     } catch (err: any) {
-      setError(err.message || "An unknown error occurred.");
+      console.error('Error:', err);
+      setError(err.message || 'An error occurred. Please try again.');
     } finally {
       setIsSubmitting(false);
+      setProgress('');
     }
+  };
+
+  const downloadTemplate = () => {
+    window.open('http://localhost:4000/api/csv-template', '_blank');
   };
 
   return (
@@ -95,10 +152,26 @@ const UploadView: React.FC<UploadViewProps> = ({ setActiveView, setJobId }) => {
         <h2 className="text-3xl font-light mb-2 tracking-tight">Start Distribution</h2>
         <p className="text-zinc-400 mb-10 text-sm">Upload your CSV and configure distribution settings</p>
 
+        {!publicKey && (
+          <div className="mb-8 p-4 bg-amber-950/30 border border-amber-900/30 rounded-xl flex items-start gap-3">
+            <AlertCircle className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" />
+            <div className="text-sm text-amber-300">
+              Please connect your wallet to continue. Click "Select Wallet" in the header.
+            </div>
+          </div>
+        )}
+
         {error && (
           <div className="mb-8 p-4 bg-red-950/30 border border-red-900/30 rounded-xl flex items-start gap-3">
             <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
             <div className="text-sm text-red-300">{error}</div>
+          </div>
+        )}
+
+        {progress && (
+          <div className="mb-8 p-4 bg-blue-950/30 border border-blue-900/30 rounded-xl flex items-start gap-3">
+            <Loader2 className="w-5 h-5 text-blue-400 flex-shrink-0 mt-0.5 animate-spin" />
+            <div className="text-sm text-blue-300">{progress}</div>
           </div>
         )}
 
@@ -142,18 +215,6 @@ const UploadView: React.FC<UploadViewProps> = ({ setActiveView, setJobId }) => {
           </div>
 
           <div>
-            <label className="block text-sm font-medium mb-3 text-zinc-300">Distributor Private Key</label>
-            <input type="password" value={privateKey} onChange={(e) => setPrivateKey(e.target.value)} placeholder="Enter base58 encoded private key"
-              className="w-full px-4 py-3.5 bg-black/40 border border-white/20 rounded-xl focus:outline-none focus:border-white/40 font-mono text-sm text-zinc-100 placeholder-zinc-600" />
-            <div className="mt-3 p-3 bg-amber-950/20 border border-amber-900/30 rounded-xl flex items-start gap-2">
-              <AlertCircle className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" />
-              <p className="text-xs text-amber-300/90 leading-relaxed">
-                <strong>For Devnet Use Only.</strong> Never share your private key or use a mainnet wallet with real funds.
-              </p>
-            </div>
-          </div>
-
-          <div>
             <label className="block text-sm font-medium mb-4 text-zinc-300">Distribution Mode</label>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <button type="button" onClick={() => setMode('high-assurance')}
@@ -179,12 +240,12 @@ const UploadView: React.FC<UploadViewProps> = ({ setActiveView, setJobId }) => {
             </div>
           </div>
 
-          <button type="submit" disabled={isSubmitting || !csvFile}
+          <button type="submit" disabled={isSubmitting || !csvFile || !publicKey}
             className="w-full py-4 bg-gradient-to-br from-zinc-200 to-white text-zinc-900 rounded-xl font-medium flex items-center justify-center gap-2 hover:shadow-lg hover:shadow-white/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed hover:scale-[1.01]">
             {isSubmitting ? (
               <>
                 <Loader2 className="w-5 h-5 animate-spin" />
-                Initiating...
+                Processing...
               </>
             ) : (
               'Start Distribution'

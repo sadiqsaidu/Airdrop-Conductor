@@ -1,5 +1,6 @@
 import React from 'react';
 import { Zap } from 'lucide-react';
+import { WalletMultiButton } from '@solana/wallet-adapter-react-ui';
 import { View } from '../App';
 
 interface HeaderProps {
@@ -20,7 +21,6 @@ const Header: React.FC<HeaderProps> = ({ setActiveView, activeView }) => {
 
     if (activeView !== 'home') {
       setActiveView('home');
-      // Timeout ensures the home view is rendered before we try to scroll
       setTimeout(scrollToAction, 100);
     } else {
       scrollToAction();
@@ -42,15 +42,18 @@ const Header: React.FC<HeaderProps> = ({ setActiveView, activeView }) => {
               Conductor
             </h1>
           </div>
+          
           <nav className="hidden md:flex gap-8 text-sm">
             <a href="#features" onClick={(e) => handleNavClick(e, 'features')} className="text-zinc-500 hover:text-zinc-300 transition-all">
               Features
             </a>
-             <a href="#how-it-works" onClick={(e) => handleNavClick(e, 'how-it-works')} className="text-zinc-500 hover:text-zinc-300 transition-all">
+            <a href="#how-it-works" onClick={(e) => handleNavClick(e, 'how-it-works')} className="text-zinc-500 hover:text-zinc-300 transition-all">
               How It Works
             </a>
           </nav>
+          
           <div className="flex items-center gap-3">
+            <WalletMultiButton className="!bg-gradient-to-br !from-zinc-200 !to-white !text-zinc-900 !rounded-lg !font-medium !px-4 !py-2 !text-sm hover:!shadow-lg hover:!shadow-white/20 transition-all" />
             <div className="px-3 py-1.5 border border-white/10 rounded-lg text-xs flex items-center gap-2 bg-white/5">
               <div className="w-1.5 h-1.5 bg-zinc-400 rounded-full"></div>
               <span className="text-zinc-400">Devnet</span>
