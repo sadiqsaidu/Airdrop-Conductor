@@ -1,12 +1,6 @@
 /*
  * =============================================================================
- * Conductor Backend - WITH ENHANCED DEBUGGING & ERROR HANDLING
- * =============================================================================
- * Added:
- * - Detailed transaction logging before sending to Sanctum
- * - Better error messages from Sanctum API
- * - Option to use direct RPC as fallback
- * - Transaction simulation before sending
+ * Conductor Backend - UPDATED FOR RENDER DEPLOYMENT
  * =============================================================================
  */
 
@@ -34,15 +28,20 @@ import {
   getMint,
 } from '@solana/spl-token';
 import bs58 from 'bs58';
-import cors from 'cors';
+import { fileURLToPath } from 'url';
+import path from 'path';
+
+// --- Path Setup for ES Modules ---
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // --- Configuration ---
 const PORT = process.env.PORT || 4000;
 const DB_FILE = './conductor.db';
 const MAX_RETRIES = 3;
 const RATE_LIMIT_DELAY_MS = 350;
-const USE_SANCTUM_GATEWAY = true; // Set to false to use direct RPC
-const ENABLE_DEBUG_LOGGING = true; // Set to false to reduce logs
+const USE_SANCTUM_GATEWAY = true;
+const ENABLE_DEBUG_LOGGING = true;
 
 const SOLANA_RPC_URL = 'https://api.devnet.solana.com';
 const GATEWAY_API_URL_BASE = 'https://tpg.sanctum.so/v1/devnet';
@@ -111,8 +110,9 @@ function debugLog(message, data = null) {
 
 // --- Express App Setup ---
 const app = express();
-app.use(cors());
 app.use(express.json());
+
+// NOTE: CORS removed since frontend and backend are served from same origin
 
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
@@ -398,6 +398,21 @@ app.get('/api/csv-template', (req, res) => {
   res.send(csvContent);
 });
 
+// --- Serve Frontend Static Files ---
+console.log('Environment:', process.env.NODE_ENV);
+console.log('Serving frontend from:', path.join(__dirname, 'frontend/dist'));
+
+app.use(express.static(path.join(__dirname, 'frontend/dist')));
+
+// Handle SPA routing - send all non-API requests to index.html
+app.get('*', (req, res) => {
+  if (!req.path.startsWith('/api')) {
+    res.sendFile(path.join(__dirname, 'frontend/dist/index.html'));
+  } else {
+    res.status(404).json({ error: 'API endpoint not found' });
+  }
+});
+
 // --- Job Processing Worker ---
 
 async function processJob(jobId) {
@@ -468,7 +483,6 @@ async function processJob(jobId) {
 
         const instructions = [];
         
-        // Add compute budget for priority fees
         instructions.push(
           ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 1000 })
         );
@@ -510,7 +524,6 @@ async function processJob(jobId) {
         let signature;
 
         if (USE_SANCTUM_GATEWAY) {
-          // Use Sanctum Gateway with correct base64 encoding
           const buildParams = {
             "high-assurance": {
               cuPriceRange: "high",
@@ -527,7 +540,6 @@ async function processJob(jobId) {
 
           debugLog(`Calling Sanctum buildGatewayTransaction with mode: ${job.mode}`);
 
-          // Convert to base64 (Sanctum expects base64, not base58)
           const txBase64 = Buffer.from(unsignedTx.serialize()).toString('base64');
 
           const rpcPayload = {
@@ -563,13 +575,11 @@ async function processJob(jobId) {
           
           const encodedTransaction = buildResult.result.transaction;
 
-          // Decode from base64
           const rebuiltTx = VersionedTransaction.deserialize(
             Buffer.from(encodedTransaction, 'base64')
           );
           rebuiltTx.sign([distributorKeypair]);
 
-          // Send with base64 encoding
           const signedTxBase64 = Buffer.from(rebuiltTx.serialize()).toString('base64');
 
           const sendPayload = {
@@ -604,7 +614,6 @@ async function processJob(jobId) {
           signature = sendResult.result;
 
         } else {
-          // Direct RPC fallback
           console.log(`[Worker ${jobId}]: Using direct RPC submission`);
           unsignedTx.sign([distributorKeypair]);
           
@@ -613,7 +622,6 @@ async function processJob(jobId) {
             skipPreflight: false,
           });
 
-          // Wait for confirmation
           await connection.confirmTransaction({
             signature,
             blockhash: latestBlockhash.blockhash,

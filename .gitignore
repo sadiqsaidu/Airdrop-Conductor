@@ -10,3 +10,14 @@ dist/
 build/
 .vscode/
 .DS_Store
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Frontend build
+frontend/dist/
+
+# Render
+.render/
