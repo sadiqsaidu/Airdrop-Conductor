@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import WalletContextProvider from './contexts/WalletContextProvider';
 import Header from './components/Header';
 import StarryBackground from './components/StarryBackground';

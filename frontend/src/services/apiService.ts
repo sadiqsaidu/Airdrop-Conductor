@@ -1,6 +1,10 @@
+// src/services/apiService.ts
 import { JobStatus, Task } from '../types';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000/api';
+// Cast import.meta to any to avoid "Property 'env' does not exist on type 'ImportMeta'" TS error
+const API_BASE_URL =
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (import.meta as any).env?.VITE_API_BASE_URL || 'http://localhost:4000/api';
 
 export const createJob = async (formData: FormData): Promise<any> => {
   const response = await fetch(`${API_BASE_URL}/create-job`, {
