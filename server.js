@@ -1,36 +1,12 @@
 /*
  * =============================================================================
- * Conductor Backend (server.js) - IMPROVED VERSION
+ * Conductor Backend - WITH ENHANCED DEBUGGING & ERROR HANDLING
  * =============================================================================
- * This file contains the complete backend for the Conductor application.
- * It is a minimal, robust, hackathon-ready server that does the following:
- *
- * 1. Runs an Express server for API endpoints.
- * 2. Uses SQLite (a local file) for all database/job queue storage.
- * 3. Provides a `/api/start-job` endpoint that:
- * - Accepts a CSV file, private key, token mint, and mode.
- * - Parses the CSV and populates a job queue in the SQLite DB.
- * 4. Provides a `/api/job-status/:job_id` endpoint for the frontend to poll.
- * 5. Provides a `/api/job-tasks/:job_id` endpoint to get detailed task info.
- * 6. Provides a `/api/cancel-job/:job_id` endpoint to cancel running jobs.
- * 7. Runs an asynchronous background worker (`processJob`) that:
- * - Processes each task from the queue.
- * - Creates SPL token transfer transactions.
- * - Calls Sanctum Gateway's `buildGatewayTransaction` to optimize.
- * - Signs the transaction.
- * - Calls Sanctum Gateway's `sendTransaction` to send.
- * - Handles retries (up to 3) on failure.
- * - Respects Sanctum rate limits with delays between requests.
- *
- * IMPROVEMENTS INCLUDED:
- * - Fixed missing import (createAssociatedTokenAccountInstruction)
- * - Added error_message column to jobs table
- * - Added rate limiting delay (350ms between tasks)
- * - Added task details endpoint
- * - Added health check endpoint
- * - Added job cancellation endpoint
- * - Better error messages and logging
- * - Token balance validation before job start
+ * Added:
+ * - Detailed transaction logging before sending to Sanctum
+ * - Better error messages from Sanctum API
+ * - Option to use direct RPC as fallback
+ * - Transaction simulation before sending
  * =============================================================================
  */
 
@@ -46,19 +22,16 @@ import {
   Connection,
   Keypair,
   PublicKey,
-  Transaction,
-  SystemProgram,
-  sendAndConfirmTransaction,
   TransactionMessage,
   VersionedTransaction,
-  AddressLookupTableAccount,
+  ComputeBudgetProgram,
 } from '@solana/web3.js';
 import {
   getOrCreateAssociatedTokenAccount,
   createTransferInstruction,
   getAssociatedTokenAddress,
   createAssociatedTokenAccountInstruction,
-  TOKEN_PROGRAM_ID,
+  getMint,
 } from '@solana/spl-token';
 import bs58 from 'bs58';
 import cors from 'cors';
@@ -67,13 +40,13 @@ import cors from 'cors';
 const PORT = process.env.PORT || 4000;
 const DB_FILE = './conductor.db';
 const MAX_RETRIES = 3;
-const RATE_LIMIT_DELAY_MS = 350; // ~3 requests per second (30 per 10s limit)
+const RATE_LIMIT_DELAY_MS = 350;
+const USE_SANCTUM_GATEWAY = true; // Set to false to use direct RPC
+const ENABLE_DEBUG_LOGGING = true; // Set to false to reduce logs
 
-// NOTE: This must be pointed to the cluster you are using (e.g., devnet)
-// We need this for building the transaction, Sanctum handles the sending.
 const SOLANA_RPC_URL = 'https://api.devnet.solana.com';
-const GATEWAY_API_URL_BASE = 'https://tpg.sanctum.so/v1/devnet'; // Using devnet endpoint
-const SANCTUM_API_KEY = process.env.SANCTUM_API_KEY || 'YOUR_SANCTUM_API_KEY_HERE'; // <-- IMPORTANT
+const GATEWAY_API_URL_BASE = 'https://tpg.sanctum.so/v1/devnet';
+const SANCTUM_API_KEY = process.env.SANCTUM_API_KEY || 'YOUR_SANCTUM_API_KEY_HERE';
 
 if (SANCTUM_API_KEY === 'YOUR_SANCTUM_API_KEY_HERE') {
   console.warn('!!! WARNING: SANCTUM_API_KEY is not set. Please set it in your environment variables. !!!');
@@ -84,9 +57,6 @@ const GATEWAY_API_URL = `${GATEWAY_API_URL_BASE}?apiKey=${SANCTUM_API_KEY}`;
 // --- Database Setup ---
 let db;
 
-/**
- * Initializes the SQLite database and creates tables if they don't exist.
- */
 async function setupDatabase() {
   db = await open({
     filename: DB_FILE,
@@ -97,6 +67,7 @@ async function setupDatabase() {
     CREATE TABLE IF NOT EXISTS jobs (
       job_id TEXT PRIMARY KEY,
       token_mint_address TEXT NOT NULL,
+      token_decimals INTEGER NOT NULL,
       distributor_private_key TEXT NOT NULL,
       mode TEXT NOT NULL,
       status TEXT NOT NULL,
@@ -122,40 +93,44 @@ async function setupDatabase() {
   console.log('Database initialized successfully.');
 }
 
+// --- Utility Functions ---
+
+function toSmallestUnit(amount, decimals) {
+  const amountStr = String(amount);
+  const [whole, fraction = ''] = amountStr.split('.');
+  const paddedFraction = fraction.padEnd(decimals, '0').slice(0, decimals);
+  const smallestUnitStr = whole + paddedFraction;
+  return BigInt(smallestUnitStr);
+}
+
+function debugLog(message, data = null) {
+  if (ENABLE_DEBUG_LOGGING) {
+    console.log(`[DEBUG] ${message}`, data || '');
+  }
+}
+
 // --- Express App Setup ---
 const app = express();
-app.use(cors()); // Allow all origins for simplicity in a hackathon
+app.use(cors());
 app.use(express.json());
 
-// Configure Multer for in-memory file storage
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
 // --- API Endpoints ---
 
-/**
- * Health check endpoint
- */
 app.get('/api/health', (req, res) => {
   res.status(200).json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(),
-    sanctumConfigured: SANCTUM_API_KEY !== 'YOUR_SANCTUM_API_KEY_HERE'
+    sanctumConfigured: SANCTUM_API_KEY !== 'YOUR_SANCTUM_API_KEY_HERE',
+    usingSanctumGateway: USE_SANCTUM_GATEWAY
   });
 });
 
-/**
- * Endpoint to start a new distribution job.
- * Accepts multipart/form-data with:
- * - csvFile: The CSV file of recipients
- * - tokenMintAddress: The SPL token to send
- * - privateKey: The distributor's private key
- * - mode: 'cost-saver' or 'high-assurance'
- */
 app.post('/api/start-job', upload.single('csvFile'), async (req, res) => {
   const { tokenMintAddress, privateKey, mode } = req.body;
 
-  // --- Basic Validation ---
   if (!req.file) {
     return res.status(400).json({ error: 'No CSV file uploaded.' });
   }
@@ -166,7 +141,6 @@ app.post('/api/start-job', upload.single('csvFile'), async (req, res) => {
     return res.status(400).json({ error: 'Mode must be either "cost-saver" or "high-assurance".' });
   }
   
-  // Validate private key format
   let distributorKeypair;
   try {
     distributorKeypair = Keypair.fromSecretKey(bs58.decode(privateKey));
@@ -174,7 +148,6 @@ app.post('/api/start-job', upload.single('csvFile'), async (req, res) => {
     return res.status(400).json({ error: 'Invalid private key format. Must be base58 encoded.' });
   }
 
-  // Validate token mint address
   let tokenMintPubkey;
   try {
     tokenMintPubkey = new PublicKey(tokenMintAddress);
@@ -186,7 +159,12 @@ app.post('/api/start-job', upload.single('csvFile'), async (req, res) => {
   const csvBuffer = req.file.buffer;
 
   try {
-    // 1. Parse the CSV first to validate before creating job
+    const connection = new Connection(SOLANA_RPC_URL, 'confirmed');
+    
+    const mintInfo = await getMint(connection, tokenMintPubkey);
+    const tokenDecimals = mintInfo.decimals;
+    console.log(`[Job ${jobId}]: Token decimals: ${tokenDecimals}`);
+
     const tasks = [];
     const parser = Readable.from(csvBuffer).pipe(
       parse({ columns: true, skip_empty_lines: true, trim: true })
@@ -199,7 +177,6 @@ app.post('/api/start-job', upload.single('csvFile'), async (req, res) => {
       const address = record.address?.trim();
       const amount = record.amount?.trim();
       
-      // Basic CSV validation
       if (!address || !amount) {
         console.warn(`Skipping row with missing data: ${JSON.stringify(record)}`);
         continue;
@@ -211,15 +188,19 @@ app.post('/api/start-job', upload.single('csvFile'), async (req, res) => {
       }
       
       try {
-        // Validate Solana address
         new PublicKey(address);
       } catch (err) {
         console.warn(`Skipping invalid Solana address: ${address}`);
         continue;
       }
 
-      tasks.push(record);
-      totalAmount += BigInt(amount);
+      const amountInSmallestUnit = toSmallestUnit(amount, tokenDecimals);
+      
+      tasks.push({
+        address,
+        amount: amountInSmallestUnit.toString()
+      });
+      totalAmount += amountInSmallestUnit;
       taskCount++;
     }
 
@@ -227,9 +208,7 @@ app.post('/api/start-job', upload.single('csvFile'), async (req, res) => {
       return res.status(400).json({ error: 'CSV file is empty or contains no valid data.' });
     }
 
-    // 2. Check token balance
     try {
-      const connection = new Connection(SOLANA_RPC_URL, 'confirmed');
       const distributorTokenAccount = await getOrCreateAssociatedTokenAccount(
         connection,
         distributorKeypair,
@@ -259,13 +238,11 @@ app.post('/api/start-job', upload.single('csvFile'), async (req, res) => {
       });
     }
 
-    // 3. Insert the main job
     await db.run(
-      'INSERT INTO jobs (job_id, token_mint_address, distributor_private_key, mode, status) VALUES (?, ?, ?, ?, ?)',
-      [jobId, tokenMintAddress, privateKey, mode, 'pending']
+      'INSERT INTO jobs (job_id, token_mint_address, token_decimals, distributor_private_key, mode, status) VALUES (?, ?, ?, ?, ?, ?)',
+      [jobId, tokenMintAddress, tokenDecimals, privateKey, mode, 'pending']
     );
 
-    // 4. Insert tasks
     await db.run('BEGIN TRANSACTION');
     const stmt = await db.prepare(
       'INSERT INTO tasks (job_id, recipient_address, amount, status, retry_count) VALUES (?, ?, ?, ?, ?)'
@@ -276,22 +253,20 @@ app.post('/api/start-job', upload.single('csvFile'), async (req, res) => {
     await stmt.finalize();
     await db.run('COMMIT');
 
-    // 5. Respond to frontend immediately
     res.status(202).json({
       message: `Job started with ${taskCount} tasks.`,
       job_id: jobId,
       total_tasks: taskCount,
       total_amount: totalAmount.toString(),
+      token_decimals: tokenDecimals,
       mode: mode
     });
 
-    // 6. Trigger the job processor asynchronously
     console.log(`[Job ${jobId}]: Triggering job processor for ${taskCount} tasks`);
-    processJob(jobId); // Note: Not awaited
+    processJob(jobId);
 
   } catch (err) {
     console.error(`Error starting job ${jobId}:`, err);
-    // Clean up if job creation failed
     try {
       await db.run('DELETE FROM jobs WHERE job_id = ?', jobId);
       await db.run('DELETE FROM tasks WHERE job_id = ?', jobId);
@@ -302,9 +277,6 @@ app.post('/api/start-job', upload.single('csvFile'), async (req, res) => {
   }
 });
 
-/**
- * Endpoint for the frontend to poll for job status.
- */
 app.get('/api/job-status/:job_id', async (req, res) => {
   const { job_id } = req.params;
 
@@ -335,6 +307,7 @@ app.get('/api/job-status/:job_id', async (req, res) => {
       job_status: job.status,
       mode: job.mode,
       token_mint: job.token_mint_address,
+      token_decimals: job.token_decimals,
       ...statusCounts,
       total: totalTasks.count,
       error_message: job.error_message,
@@ -347,9 +320,6 @@ app.get('/api/job-status/:job_id', async (req, res) => {
   }
 });
 
-/**
- * Endpoint to get detailed task information for a job
- */
 app.get('/api/job-tasks/:job_id', async (req, res) => {
   const { job_id } = req.params;
 
@@ -385,9 +355,6 @@ app.get('/api/job-tasks/:job_id', async (req, res) => {
   }
 });
 
-/**
- * Endpoint to cancel a running job
- */
 app.post('/api/cancel-job/:job_id', async (req, res) => {
   const { job_id } = req.params;
 
@@ -401,13 +368,11 @@ app.post('/api/cancel-job/:job_id', async (req, res) => {
       return res.status(400).json({ error: `Cannot cancel job with status: ${job.status}` });
     }
 
-    // Update job status to cancelled
     await db.run(
       'UPDATE jobs SET status = ?, error_message = ? WHERE job_id = ?',
       ['cancelled', 'Job cancelled by user', job_id]
     );
 
-    // Cancel all pending tasks
     await db.run(
       'UPDATE tasks SET status = ?, error_message = ? WHERE job_id = ? AND status = ?',
       ['failed', 'Job cancelled by user', job_id, 'pending']
@@ -426,9 +391,6 @@ app.post('/api/cancel-job/:job_id', async (req, res) => {
   }
 });
 
-/**
- * Endpoint to download CSV template
- */
 app.get('/api/csv-template', (req, res) => {
   const csvContent = 'address,amount\nYOUR_RECIPIENT_ADDRESS_HERE,1000000\nANOTHER_ADDRESS_HERE,500000';
   res.setHeader('Content-Type', 'text/csv');
@@ -438,10 +400,6 @@ app.get('/api/csv-template', (req, res) => {
 
 // --- Job Processing Worker ---
 
-/**
- * The main job processor. Fetches and processes tasks from the queue.
- * @param {string} jobId - The ID of the job to process.
- */
 async function processJob(jobId) {
   console.log(`[Worker ${jobId}]: Starting...`);
   let connection;
@@ -455,16 +413,16 @@ async function processJob(jobId) {
 
     await db.run('UPDATE jobs SET status = ? WHERE job_id = ?', ['running', jobId]);
     
-    // Setup Solana connection and distributor keypair
     connection = new Connection(SOLANA_RPC_URL, 'confirmed');
     const distributorKeypair = Keypair.fromSecretKey(bs58.decode(job.distributor_private_key));
     const tokenMintPubkey = new PublicKey(job.token_mint_address);
 
     console.log(`[Worker ${jobId}]: Distributor Wallet: ${distributorKeypair.publicKey.toBase58()}`);
     console.log(`[Worker ${jobId}]: Token Mint: ${tokenMintPubkey.toBase58()}`);
+    console.log(`[Worker ${jobId}]: Token Decimals: ${job.token_decimals}`);
     console.log(`[Worker ${jobId}]: Mode: ${job.mode}`);
+    console.log(`[Worker ${jobId}]: Using ${USE_SANCTUM_GATEWAY ? 'Sanctum Gateway' : 'Direct RPC'}`);
 
-    // Get the distributor's token account
     const distributorTokenAccount = await getOrCreateAssociatedTokenAccount(
       connection,
       distributorKeypair,
@@ -473,10 +431,8 @@ async function processJob(jobId) {
     );
     console.log(`[Worker ${jobId}]: Distributor ATA: ${distributorTokenAccount.address.toBase58()}`);
 
-    // Loop until all tasks are processed
     let running = true;
     while (running) {
-      // Check if job was cancelled
       const currentJob = await db.get('SELECT status FROM jobs WHERE job_id = ?', jobId);
       if (currentJob.status === 'cancelled') {
         console.log(`[Worker ${jobId}]: Job was cancelled. Stopping.`);
@@ -502,47 +458,43 @@ async function processJob(jobId) {
       );
 
       try {
-        // --- Core Transaction Logic ---
-        
-        // 1. Get recipient info
         const recipientPubkey = new PublicKey(task.recipient_address);
-        // We use BigInt for token amounts to avoid precision errors
-        const transferAmount = BigInt(task.amount); 
+        const transferAmount = BigInt(task.amount);
 
-        // 2. Find recipient's ATA
         const recipientTokenAccount = await getAssociatedTokenAddress(
           tokenMintPubkey,
           recipientPubkey
         );
 
-        // 3. Build the v0 transaction
-        // We must check if the recipient's ATA exists.
-        // If it doesn't, we MUST include the create ATA instruction.
         const instructions = [];
+        
+        // Add compute budget for priority fees
+        instructions.push(
+          ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 1000 })
+        );
+
         const recipientAtaInfo = await connection.getAccountInfo(recipientTokenAccount);
         if (!recipientAtaInfo) {
-          console.log(`[Worker ${jobId}]: Recipient ATA not found. Creating one.`);
+          console.log(`[Worker ${jobId}]: Creating recipient ATA for ${task.recipient_address}`);
           instructions.push(
             createAssociatedTokenAccountInstruction(
-              distributorKeypair.publicKey, // Payer
-              recipientTokenAccount,        // ATA
-              recipientPubkey,              // Owner
-              tokenMintPubkey               // Mint
+              distributorKeypair.publicKey,
+              recipientTokenAccount,
+              recipientPubkey,
+              tokenMintPubkey
             )
           );
         }
 
-        // Add the main transfer instruction
         instructions.push(
           createTransferInstruction(
-            distributorTokenAccount.address, // From
-            recipientTokenAccount,           // To
-            distributorKeypair.publicKey,    // Owner
-            transferAmount                   // Amount
+            distributorTokenAccount.address,
+            recipientTokenAccount,
+            distributorKeypair.publicKey,
+            transferAmount
           )
         );
         
-        // 4. Create the v0 Transaction
         let latestBlockhash = await connection.getLatestBlockhash('confirmed');
         const messageV0 = new TransactionMessage({
           payerKey: distributorKeypair.publicKey,
@@ -552,93 +504,138 @@ async function processJob(jobId) {
         
         const unsignedTx = new VersionedTransaction(messageV0);
 
-        // 5. CALL SANCTUM: buildGatewayTransaction
-        const buildParams = {
-          "high-assurance": {
-            cuPriceRange: "high",
-            jitoTipRange: "high",
-            deliveryMethodType: "sanctum-sender"
-          },
-          "cost-saver": {
-            cuPriceRange: "low",
-            deliveryMethodType: "rpc"
+        debugLog(`Transaction instructions count: ${instructions.length}`);
+        debugLog(`Transaction serialized size: ${unsignedTx.serialize().length} bytes`);
+
+        let signature;
+
+        if (USE_SANCTUM_GATEWAY) {
+          // Use Sanctum Gateway with correct base64 encoding
+          const buildParams = {
+            "high-assurance": {
+              cuPriceRange: "high",
+              jitoTipRange: "high",
+              deliveryMethodType: "sanctum-sender",
+              encoding: "base64"
+            },
+            "cost-saver": {
+              cuPriceRange: "low",
+              deliveryMethodType: "rpc",
+              encoding: "base64"
+            }
+          };
+
+          debugLog(`Calling Sanctum buildGatewayTransaction with mode: ${job.mode}`);
+
+          // Convert to base64 (Sanctum expects base64, not base58)
+          const txBase64 = Buffer.from(unsignedTx.serialize()).toString('base64');
+
+          const rpcPayload = {
+            jsonrpc: "2.0",
+            id: `conductor-${jobId}-${task.task_id}`,
+            method: "buildGatewayTransaction",
+            params: [
+              txBase64,
+              buildParams[job.mode]
+            ]
+          };
+
+          debugLog(`RPC Payload:`, JSON.stringify(rpcPayload, null, 2));
+
+          const buildResponse = await fetch(GATEWAY_API_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(rpcPayload),
+          });
+
+          const buildResponseText = await buildResponse.text();
+          debugLog(`Build response status: ${buildResponse.status}`);
+          debugLog(`Build response body: ${buildResponseText}`);
+
+          if (!buildResponse.ok) {
+            throw new Error(`Sanctum buildGatewayTransaction failed (${buildResponse.status}): ${buildResponseText}`);
           }
-        };
 
-        const rpcPayload = {
-          jsonrpc: "2.0",
-          id: `conductor-${jobId}-${task.task_id}`,
-          method: "buildGatewayTransaction",
-          params: [
-            bs58.encode(unsignedTx.serialize()),
-            buildParams[job.mode]
-          ]
-        };
+          const buildResult = JSON.parse(buildResponseText);
+          if (buildResult.error) {
+            throw new Error(`Sanctum buildGatewayTransaction error: ${JSON.stringify(buildResult.error)}`);
+          }
+          
+          const encodedTransaction = buildResult.result.transaction;
 
-        const buildResponse = await fetch(GATEWAY_API_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(rpcPayload),
-        });
+          // Decode from base64
+          const rebuiltTx = VersionedTransaction.deserialize(
+            Buffer.from(encodedTransaction, 'base64')
+          );
+          rebuiltTx.sign([distributorKeypair]);
 
-        if (!buildResponse.ok) {
-          const errorText = await buildResponse.text();
-          throw new Error(`Sanctum buildGatewayTransaction failed (${buildResponse.status}): ${errorText}`);
+          // Send with base64 encoding
+          const signedTxBase64 = Buffer.from(rebuiltTx.serialize()).toString('base64');
+
+          const sendPayload = {
+            jsonrpc: "2.0",
+            id: `conductor-send-${jobId}-${task.task_id}`,
+            method: "sendTransaction",
+            params: [
+              signedTxBase64,
+              { encoding: "base64" }
+            ]
+          };
+
+          const sendResponse = await fetch(GATEWAY_API_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(sendPayload),
+          });
+
+          const sendResponseText = await sendResponse.text();
+          debugLog(`Send response status: ${sendResponse.status}`);
+          debugLog(`Send response body: ${sendResponseText}`);
+
+          if (!sendResponse.ok) {
+            throw new Error(`Sanctum sendTransaction failed (${sendResponse.status}): ${sendResponseText}`);
+          }
+          
+          const sendResult = JSON.parse(sendResponseText);
+          if (sendResult.error) {
+            throw new Error(`Sanctum sendTransaction error: ${JSON.stringify(sendResult.error)}`);
+          }
+
+          signature = sendResult.result;
+
+        } else {
+          // Direct RPC fallback
+          console.log(`[Worker ${jobId}]: Using direct RPC submission`);
+          unsignedTx.sign([distributorKeypair]);
+          
+          signature = await connection.sendTransaction(unsignedTx, {
+            maxRetries: 3,
+            skipPreflight: false,
+          });
+
+          // Wait for confirmation
+          await connection.confirmTransaction({
+            signature,
+            blockhash: latestBlockhash.blockhash,
+            lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+          }, 'confirmed');
         }
 
-        const buildResult = await buildResponse.json();
-        if (buildResult.error) {
-          throw new Error(`Sanctum buildGatewayTransaction error: ${JSON.stringify(buildResult.error)}`);
-        }
-        
-        const encodedTransaction = buildResult.result.transaction;
-
-        // 6. Sign the transaction returned by Sanctum
-        const rebuiltTx = VersionedTransaction.deserialize(bs58.decode(encodedTransaction));
-        rebuiltTx.sign([distributorKeypair]);
-
-        // 7. CALL SANCTUM: sendTransaction
-        const sendPayload = {
-          jsonrpc: "2.0",
-          id: `conductor-send-${jobId}-${task.task_id}`,
-          method: "sendTransaction",
-          params: [
-            bs58.encode(rebuiltTx.serialize()),
-            { encoding: "base58" }
-          ]
-        };
-
-        const sendResponse = await fetch(GATEWAY_API_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(sendPayload),
-        });
-
-        if (!sendResponse.ok) {
-          const errorText = await sendResponse.text();
-          throw new Error(`Sanctum sendTransaction failed (${sendResponse.status}): ${errorText}`);
-        }
-        
-        const sendResult = await sendResponse.json();
-        if (sendResult.error) {
-          throw new Error(`Sanctum sendTransaction error: ${JSON.stringify(sendResult.error)}`);
-        }
-
-        const signature = sendResult.result;
         console.log(`[Worker ${jobId}]: Task ${task.task_id} successful. Signature: ${signature}`);
 
-        // --- Success ---
         await db.run(
           'UPDATE tasks SET status = ?, tx_signature = ?, error_message = NULL WHERE task_id = ?',
           ['success', signature, task.task_id]
         );
 
-        // Rate limiting delay
         await new Promise(resolve => setTimeout(resolve, RATE_LIMIT_DELAY_MS));
 
       } catch (err) {
-        // --- Failure & Retry Logic ---
         console.error(`[Worker ${jobId}]: Task ${task.task_id} failed. Error: ${err.message}`);
+        if (ENABLE_DEBUG_LOGGING) {
+          console.error(`[Worker ${jobId}]: Full error:`, err);
+        }
+        
         const newRetryCount = task.retry_count + 1;
         
         if (newRetryCount >= MAX_RETRIES) {
@@ -648,20 +645,17 @@ async function processJob(jobId) {
           );
           console.log(`[Worker ${jobId}]: Task ${task.task_id} failed permanently after ${MAX_RETRIES} retries.`);
         } else {
-          // Set back to 'pending' to be picked up again
           await db.run(
             'UPDATE tasks SET status = ?, retry_count = ?, error_message = ? WHERE task_id = ?',
             ['pending', newRetryCount, err.message.substring(0, 500), task.task_id]
           );
           console.log(`[Worker ${jobId}]: Task ${task.task_id} will retry (${newRetryCount}/${MAX_RETRIES})`);
           
-          // Add a longer delay before retry
           await new Promise(resolve => setTimeout(resolve, RATE_LIMIT_DELAY_MS * 2));
         }
       }
     }
     
-    // Final job status update
     const currentJobStatus = await db.get('SELECT status FROM jobs WHERE job_id = ?', jobId);
     if (currentJobStatus.status === 'running') {
       await db.run('UPDATE jobs SET status = ? WHERE job_id = ?', ['completed', jobId]);
@@ -672,6 +666,9 @@ async function processJob(jobId) {
 
   } catch (err) {
     console.error(`[Worker ${jobId}]: A fatal error occurred: ${err.message}`);
+    if (ENABLE_DEBUG_LOGGING) {
+      console.error(`[Worker ${jobId}]: Full error:`, err);
+    }
     await db.run(
       'UPDATE jobs SET status = ?, error_message = ? WHERE job_id = ?',
       ['failed', err.message.substring(0, 500), jobId]
@@ -693,6 +690,8 @@ async function processJob(jobId) {
 📊 Database: ${DB_FILE}
 🌐 Solana RPC: ${SOLANA_RPC_URL}
 ⚡ Gateway URL: ${GATEWAY_API_URL_BASE}
+🔧 Mode: ${USE_SANCTUM_GATEWAY ? 'Sanctum Gateway' : 'Direct RPC'}
+🐛 Debug Logging: ${ENABLE_DEBUG_LOGGING ? 'Enabled' : 'Disabled'}
 
 Available Endpoints:
   GET  /api/health
@@ -702,7 +701,7 @@ Available Endpoints:
   POST /api/cancel-job/:job_id
   GET  /api/csv-template
 
-${SANCTUM_API_KEY === 'YOUR_SANCTUM_API_KEY_HERE' ? '⚠️  WARNING: Set SANCTUM_API_KEY environment variable before starting jobs!\n' : ''}Ready to process transactions! 🎉
+${SANCTUM_API_KEY === 'YOUR_SANCTUM_API_KEY_HERE' && USE_SANCTUM_GATEWAY ? '⚠️  WARNING: Set SANCTUM_API_KEY environment variable!\n' : ''}Ready to process transactions! 🎉
     `);
   });
 })();
